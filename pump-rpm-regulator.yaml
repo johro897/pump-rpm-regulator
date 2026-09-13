@@ -1,6 +1,6 @@
 # ============================================================
 #  Pool Pump RPM Regulator  –  Kripsol pool pump, frequency converter (VFD)
-#  Custom Modbus-RTU-style protocol – exact VFD manufacturer unconfirmed
+#  Protocol: iSAVER RS485 (see CLAUDE.md "Protocol" for sources/deviations)
 #  Board   : ESP32 Dev Module
 #  UART    : TX=GPIO17  RX=GPIO16  1200 8N1
 #  RS485   : DE/RE write-enable on GPIO05

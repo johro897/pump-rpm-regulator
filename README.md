@@ -1,54 +1,215 @@
 # Pool Pump RPM Regulator
 
-ESPHome firmware for an ESP32 that controls a Kripsol pool pump's frequency
-converter (VFD) over RS485, using a custom Modbus-RTU-style protocol, and exposes
-RPM control and live status to Home Assistant. One self-contained YAML file, no
-external ESPHome components.
+ESPHome firmware for an ESP32 that talks RS485 to a **Kripsol** pool pump's
+built-in frequency converter (VFD), using the **iSAVER** protocol, and exposes
+full RPM control and live status to Home Assistant. One self-contained YAML
+file, no external ESPHome components, no cloud dependency — control keeps
+working over the local network even if Home Assistant itself is down.
 
-The pump keeps running whether or not Home Assistant is up — see
-[CLAUDE.md](CLAUDE.md) for the full protocol writeup, hardware wiring, and the
-bugs already found and fixed.
+See [CLAUDE.md](CLAUDE.md) for the full protocol write-up, wiring, and the
+history of bugs already found and fixed — this README covers setup and
+day-to-day use.
 
-## What it does
+## Features
 
-- Reads the pump's live status (on/off, RPM, error code) once per second over
-  RS485 and publishes it to Home Assistant.
-- Lets you set a target RPM (1200–2900) or turn the pump off from Home
-  Assistant, a number/switch entity, or the device's own web UI.
-- Survives a Home Assistant outage and a device reboot without stopping the
-  pump or losing the last setpoint.
+- **Live status polling** — RPM, on/off state, and error code read from the
+  pump once per second over RS485
+- **RPM control** — set any speed from 1200–2900 via a number entity, three
+  preset buttons (ECO / NORMAL / MAX), or a plain on/off power switch
+- **Runs independently of Home Assistant** — pump control keeps working
+  during a Home Assistant outage or a device reboot; nothing about the pump's
+  operation depends on an active API connection
+- **Setpoint survives reboot** — the last commanded RPM is restored after a
+  power cycle, without ever being able to restore into a stuck "off" state
+- **Full error decoding** — all 16 iSAVER error bits are decoded to a
+  human-readable text sensor, not just a raw error code
+- **Filter duration timer** — run at the current speed for a set number of
+  hours, then automatically drop back to ECO
+- **UART Debug Logging switch** — see raw RS485 traffic in the log when
+  troubleshooting, toggled from Home Assistant with no reflash needed
+- **Automation-friendly** — two native API services (`set_pump_rpm`,
+  `set_filter_duration`) for scripting from Home Assistant automations, in
+  addition to the regular entities
 
 ## Hardware
 
-| Item | Value |
-| --- | --- |
-| Board | ESP32 Dev Module (`esp32dev`, framework: arduino) |
-| UART | TX `GPIO17`, RX `GPIO16`, 1200 baud, 8N1 |
-| RS485 DE/RE | `GPIO05` |
-| Pump | Kripsol pool pump — RS485 talks to its frequency converter (VFD) |
+### Bill of materials
 
-## Building and flashing
+| Part | Example used | Notes |
+| --- | --- | --- |
+| ESP32 dev board | ELEGOO `EL-SM-009` | Any `esp32dev`-compatible board works |
+| TTL-to-RS485 adapter | Jopto (ASIN `B096ZXXKCR`) | Any TTL↔RS485 module works |
+| Cabling | — | RS485 twisted pair between adapter and pump, jumpers for the rest |
+| Power | — | USB power supply + cable for the ESP32 |
 
-1. Install [ESPHome](https://esphome.io/) (`pip install esphome`, or use the
-   ESPHome dashboard/add-on).
-2. Copy `secrets.yaml.example` to `secrets.yaml` and fill in your own WiFi
-   credentials and API/OTA keys (`secrets.yaml` is gitignored — never commit
-   it).
-3. Validate the config without touching any hardware:
+### Wiring
+
+| ESP32 pin | Function | Goes to |
+| --- | --- | --- |
+| `GPIO17` | UART TX | RS485 adapter RX |
+| `GPIO16` | UART RX | RS485 adapter TX |
+| `GPIO05` | RS485 DE/RE (write-enable) | RS485 adapter DE/RE, if present |
+| `GND` | Ground | Shared with pump and RS485 adapter |
+| `3.3V` / `5V` | Power | RS485 adapter (depends on adapter's voltage) |
+
+`GPIO05` is a strapping pin — ESPHome warns about it on every build, expected
+on this board. Note: an earlier build of this project used an adapter with no
+DE/RE line at all (auto-direction-sensing); the current firmware assumes one
+is present and toggles it around every write.
+
+## Requirements
+
+- [ESPHome](https://esphome.io/) 2026.8 or newer (`pip install esphome`, or
+  the Home Assistant ESPHome add-on / dashboard)
+- A Kripsol pool pump with an iSAVER-protocol frequency converter, wired as above
+- Home Assistant is optional — the device works standalone via its own web UI,
+  but exposes all entities over the native API when HA is present
+
+## Installation
+
+1. Clone this repo and copy `secrets.yaml.example` to `secrets.yaml`, filling
+   in your own values (see **Configuration** below).
+2. Validate the config without touching any hardware:
    ```
    esphome config pump-rpm-regulator.yaml
    ```
-4. Build and flash:
+3. First flash requires a USB connection:
    ```
    esphome run pump-rpm-regulator.yaml
    ```
-   First flash needs a USB connection; later updates go over OTA.
+4. Every later update goes over OTA using the same command — no cable needed
+   as long as the device is already on the network.
 
 After any change, run through the [Verification
 checklist](CLAUDE.md#verification-checklist-after-any-change) in CLAUDE.md
-against the real device before trusting it.
+against the real device before trusting it — this firmware has no automated
+test suite; the pump itself is the only thing that proves a change works.
+
+## Configuration
+
+All secrets live in `secrets.yaml` (gitignored — never commit it). Copy
+`secrets.yaml.example` and fill in:
+
+| Key | Used for |
+| --- | --- |
+| `wifi_ssid` / `wifi_password` | Home WiFi credentials |
+| `api_key` | Native API encryption key (generate per ESPHome docs) |
+| `ota_password` | Password for OTA firmware updates |
+| `static_ip` / `gateway` / `subnet` | Fixed IP configuration for the device |
+| `ap_fallback_password` | Password for the fallback AP if WiFi is unreachable |
+
+`api_key_presence` also exists in `secrets.yaml.example` but isn't currently
+referenced anywhere in the YAML — left over from an earlier iteration.
+
+## Entities exposed
+
+Entity IDs are prefixed with the device name (`pump_rpm_regulator_`) by Home
+Assistant's ESPHome integration — e.g. the RPM setpoint is
+`number.pump_rpm_regulator_pool_pump_rpm_setpoint`, not just
+`number.pool_pump_rpm_setpoint`. Tables below show the name after that prefix.
+
+### Sensors
+
+| Entity (after `sensor.pump_rpm_regulator_`) | Description |
+| --- | --- |
+| `pool_pump_rpm` | Actual RPM read from the pump's status frame |
+| `pool_pump_filter_time_remaining` | Minutes left on the filter-duration timer |
+| `wifi_signalstyrka` | WiFi signal strength (dBm) |
+| `esp_uptime` | Seconds since last boot — the fastest way to spot a silent restart |
+| `esp_temperatur` | ESP32 internal temperature |
+
+### Text sensors
+
+| Entity (after `text_sensor.pump_rpm_regulator_`) | Description |
+| --- | --- |
+| `modbus_status` | `Online`, `Waiting for packet`, or `Offline` (after 5 consecutive failed polls) |
+| `pool_pump_error` | Decoded iSAVER error text, or `No Error` |
+| `esp_ip_adress` | Current IP address |
+| `esphome_version` | Firmware version and build info |
+| `esp_reset_reason` | Why the device last restarted — OTA, brownout, watchdog, or software crash |
+
+### Binary sensor
+
+| Entity | Description |
+| --- | --- |
+| `binary_sensor.pump_rpm_regulator_esp_status` | Whether an API client (e.g. Home Assistant) is currently connected |
+
+### Number
+
+| Entity (after `number.pump_rpm_regulator_`) | Range | Description |
+| --- | --- | --- |
+| `pool_pump_rpm_setpoint` | 1200–2900, step 50 | Target RPM. Survives reboot |
+| `pool_pump_filter_duration` | 0–24 h, step 0.5 | Runs at current speed for this long, then drops to ECO (1300 RPM) |
+
+### Switch
+
+| Entity (after `switch.pump_rpm_regulator_`) | Description |
+| --- | --- |
+| `pool_pump_power` | On = 1800 RPM, Off = pump stopped. Always boots to whatever the pump itself reports, never commands it on boot |
+| `uart_debug_logging` | Toggles raw RS485 hex logging on/off at runtime, no reflash needed. Off by default on every boot |
+
+### Button
+
+| Entity (after `button.pump_rpm_regulator_`) | Sets |
+| --- | --- |
+| `pool_pump_eco` | 1300 RPM |
+| `pool_pump_normal` | 1800 RPM |
+| `pool_pump_max` | 2900 RPM |
+
+### Automation services
+
+Exposed via the ESPHome native API (`esphome.pump_rpm_regulator_<service>` in
+Home Assistant):
+
+| Service | Parameter | Description |
+| --- | --- | --- |
+| `set_pump_rpm` | `rpm` (int) | Same effect as setting the **Pool Pump RPM Setpoint** number |
+| `set_filter_duration` | `hours` (float) | Same effect as setting the **Pool Pump Filter Duration** number |
+
+These duplicate what the number entities already do via HA's standard
+`number.set_value` service — kept for now in case an existing automation
+calls them directly.
+
+## How it keeps running without Home Assistant
+
+Three deliberate settings, each guarding against a real failure this project
+hit once (full story in [CLAUDE.md](CLAUDE.md)):
+
+- `api: reboot_timeout: 0s` — the device never reboots itself for lack of an
+  API client, so a Home Assistant outage can't interrupt pump control
+- The **Pool Pump Power** switch boots with `restore_mode: DISABLED` — it never
+  commands the pump on startup; the real on/off state arrives from the pump's
+  own status frame a second later
+- The RPM setpoint only restores on boot if the stored value is a real
+  running speed (`>= 1200`) — a stuck "off" value can never be replayed
+
+## Troubleshooting
+
+| Problem | Solution |
+| --- | --- |
+| `Modbus Status` shows `Offline` | Check RS485 wiring (TX/RX not swapped, DE/RE on `GPIO05` connected) and that the pump is powered |
+| `Modbus Status` stuck on `Waiting for packet` | Fewer than 5 consecutive polls have failed yet — wait a few seconds, or check wiring if it doesn't recover |
+| Setpoint slider shows a value the pump isn't actually running at | Shouldn't happen since the `min_value: 1200` fix — if seen, the slider was set from an automation calling `set_value` with something below 1200 |
+| Pump won't turn off, or turns on at minimum speed unexpectedly | Check the **Pool Pump Power** switch's `restore_mode` is still `DISABLED` — see "How it keeps running" above |
+| Need to see raw RS485 traffic | Turn on **UART Debug Logging**, watch the log, turn it back off when done |
+| Device reboots every ~15 minutes | `api: reboot_timeout` got reset to its default — must stay `0s` |
+| Web UI reachable but device shows as unavailable in HA | The web UI (port 80) does **not** count as an API client — check the native API port (6053) isn't blocked |
 
 ## Status
 
-Verified working against real hardware as of 2026-09-13 — see CLAUDE.md's
-"Current status" section for details.
+Verified working against real hardware as of 2026-09-13 (`Modbus Status`
+Online, no error, correct RPM) — see CLAUDE.md's "Current status" section for
+what's been checked since the last firmware change, and "Things that have
+already broken, and why" for the full incident history (a two-month "Offline"
+misdiagnosis, a 15-minute self-shutdown bug, and others).
+
+## Development
+
+Single self-contained YAML file — no build tooling beyond ESPHome itself.
+`esphome compile pump-rpm-regulator.yaml` builds without flashing; on Windows
+this needs [long path support enabled](https://learn.microsoft.com/windows/win32/fileio/maximum-file-path-limitation)
+or `ESPHOME_ESP_IDF_PREFIX` set to a short path, or it fails on ESP-IDF's own
+toolchain paths. A GitHub Actions workflow
+([.github/workflows/validate.yaml](.github/workflows/validate.yaml)) runs the
+same config + compile check on Linux for every push, where that path issue
+doesn't exist.
