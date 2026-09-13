@@ -6,10 +6,6 @@ full RPM control and live status to Home Assistant. One self-contained YAML
 file, no external ESPHome components, no cloud dependency — control keeps
 working over the local network even if Home Assistant itself is down.
 
-See [CLAUDE.md](CLAUDE.md) for the full protocol write-up, wiring, and the
-history of bugs already found and fixed — this README covers setup and
-day-to-day use.
-
 ## Features
 
 - **Live status polling** — RPM, on/off state, and error code read from the
@@ -80,10 +76,9 @@ is present and toggles it around every write.
 4. Every later update goes over OTA using the same command — no cable needed
    as long as the device is already on the network.
 
-After any change, run through the [Verification
-checklist](CLAUDE.md#verification-checklist-after-any-change) in CLAUDE.md
-against the real device before trusting it — this firmware has no automated
-test suite; the pump itself is the only thing that proves a change works.
+After any change, run through the **Verification checklist** below against
+the real device before trusting it — this firmware has no automated test
+suite; the pump itself is the only thing that proves a change works.
 
 ## Configuration
 
@@ -173,7 +168,7 @@ calls them directly.
 ## How it keeps running without Home Assistant
 
 Three deliberate settings, each guarding against a real failure this project
-hit once (full story in [CLAUDE.md](CLAUDE.md)):
+hit once:
 
 - `api: reboot_timeout: 0s` — the device never reboots itself for lack of an
   API client, so a Home Assistant outage can't interrupt pump control
@@ -195,13 +190,40 @@ hit once (full story in [CLAUDE.md](CLAUDE.md)):
 | Device reboots every ~15 minutes | `api: reboot_timeout` got reset to its default — must stay `0s` |
 | Web UI reachable but device shows as unavailable in HA | The web UI (port 80) does **not** count as an API client — check the native API port (6053) isn't blocked |
 
+## Verification checklist
+
+Run through this against the real device after any change — there's no
+automated test suite, so this is the only thing that proves a change works:
+
+1. Flash, then confirm the build timestamp in the web UI is today's
+2. `Modbus Status` → `Online`, `Pool Pump Error` → `No Error`
+3. Press ECO (1300 RPM): pump audibly changes speed, RPM sensor updates
+4. Power off: verify the pump actually stops, not just drops to minimum speed
+5. Reboot with the pump running — it must keep running
+6. Disable the Home Assistant integration, leave the pump running, and check
+   that uptime passes 900s without a restart (don't open the log stream
+   during this test — it counts as an API client and resets the timer)
+7. Compare the RPM sensor against the pump's own display
+
+## Notable fixed issues
+
+- **Offline for two months while the pump was answering fine** — the parser
+  validated a CRC on the pump's status responses, but this pump's responses
+  don't carry one; every frame was silently rejected
+- **Pump switched itself off after ~15 minutes** — `api: reboot_timeout`
+  defaulted to 15 minutes, so any Home Assistant outage rebooted the device,
+  which then booted into an "off" state that got written back to flash and
+  never recovered — see "How it keeps running" above for the three guards
+  that now prevent this
+- **Setpoint slider could show a value the pump never got** — picking
+  anything from 2–1199 RPM got silently rounded up to 1200 before being sent,
+  but the displayed setpoint kept the un-rounded number; fixed by raising the
+  slider's minimum to 1200
+
 ## Status
 
-Verified working against real hardware as of 2026-09-13 (`Modbus Status`
-Online, no error, correct RPM) — see CLAUDE.md's "Current status" section for
-what's been checked since the last firmware change, and "Things that have
-already broken, and why" for the full incident history (a two-month "Offline"
-misdiagnosis, a 15-minute self-shutdown bug, and others).
+Verified working against real hardware as of 2026-09-13: `Modbus Status`
+Online, no error, correct RPM.
 
 ## Development
 
