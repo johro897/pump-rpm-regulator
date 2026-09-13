@@ -1,0 +1,503 @@
+# ============================================================
+#  Pool Pump RPM Regulator  –  Kripsol pool pump, frequency converter (VFD)
+#  Custom Modbus-RTU-style protocol – exact VFD manufacturer unconfirmed
+#  Board   : ESP32 Dev Module
+#  UART    : TX=GPIO17  RX=GPIO16  1200 8N1
+#  RS485   : DE/RE write-enable on GPIO05
+#
+#  Protocol (from official spec + observed on bus):
+#    Function 0xC3  – Read status
+#      Request  : AA C3 [start_addr 2B] [reserved 2B] [crc 2B]  = 8 bytes
+#      Response : AA C3 [error 2B] [on_off 1B] [rpm 2B]         = 7 bytes
+#                 NOTE: pump does NOT append CRC on response.
+#                 Stray bytes (F8/FF/F0/E0...) around the frame are
+#                 RS485 turnaround noise – harmless, header search skips them.
+#    Function 0xD0  – Write RPM
+#      Request  : AA D0 [start_addr 2B] [data 2B] [crc 2B]  = 8 bytes
+#    CRC-16 Modbus on requests, little-endian (lo byte first)
+#    Valid RPM: 1 = OFF, 1200–2900 = run
+#
+#  IMPORTANT – why the pump used to stop by itself:
+#    The API defaults to reboot_timeout: 15min, so with Home Assistant down
+#    the device rebooted ("No clients; rebooting"). On every boot the power
+#    switch defaulted to restore_mode ALWAYS_OFF, which fired turn_off_action
+#    and sent RPM=1 (OFF) to the pump. That 1 was then persisted to flash by
+#    the setpoint number, so all later boots "restored" the off state and the
+#    pump never came back. Three guards below prevent this:
+#      1. api: reboot_timeout: 0s        – pump control survives HA downtime
+#      2. switch: restore_mode: DISABLED – boot never commands the pump
+#      3. on_boot only restores >= 1200  – an off state can never stick
+# ============================================================
+
+esphome:
+  name: pump-rpm-regulator
+  friendly_name: pump_rpm_regulator
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          // Restore last RPM setpoint after reboot (loaded from flash).
+          // Only real running speeds are restored: if the stored value is an
+          // off state (1), re-sending it would keep the pump off forever.
+          if (id(pump_rpm).state >= 1200) {
+            id(pump_rpm).make_call()
+              .set_value(id(pump_rpm).state)
+              .perform();
+          }
+
+# ------------------------------------------------------------
+#  Hardware
+# ------------------------------------------------------------
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ------------------------------------------------------------
+#  Connectivity
+# ------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: !secret static_ip
+    gateway:   !secret gateway
+    subnet:    !secret subnet
+  ap:
+    ssid: "Pump-Rpm-Regulator"
+    password: !secret ap_fallback_password
+
+captive_portal:
+
+api:
+  # Default is 15min: with no API client (Home Assistant down, or only the
+  # web UI open — port 80 does NOT count) the device reboots itself.
+  # Pump control must keep running without HA, so the watchdog is disabled.
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_key
+  # ── HA-service: set pump RPM directly from automations ──
+  services:
+    - service: set_pump_rpm
+      variables:
+        rpm: int
+      then:
+        - lambda: |-
+            id(pump_rpm).make_call()
+              .set_value((float)rpm)
+              .perform();
+
+    - service: set_filter_duration
+      variables:
+        hours: float
+      then:
+        - lambda: |-
+            id(filter_duration_h).make_call()
+              .set_value(hours)
+              .perform();
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+web_server:
+  port: 80
+
+# ------------------------------------------------------------
+#  UART  –  RS485 @ 1200 8N1
+# ------------------------------------------------------------
+uart:
+  id: modbus_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate:  1200
+  data_bits:  8
+  stop_bits:  1
+  parity:     NONE
+  # Gated by the "UART Debug Logging" switch below instead of always-on,
+  # so it can be flipped on from HA when needed without an OTA reflash.
+  debug:
+    direction: BOTH
+    sequence:
+      - lambda: |-
+          if (id(uart_debug_enabled).state) {
+            UARTDebug::log_hex(direction, bytes, ':');
+          }
+
+# ------------------------------------------------------------
+#  RS485 Write-Enable  –  DE/RE on GPIO05
+#  HIGH = transmit,  LOW = receive
+# ------------------------------------------------------------
+output:
+  - platform: gpio
+    pin: GPIO05
+    id: modbus_write_enable
+
+# ------------------------------------------------------------
+#  Globals
+# ------------------------------------------------------------
+globals:
+  # Persistent RX buffer – assembles split UART packets across poll cycles
+  - id: uart_rx_buffer
+    type: std::vector<uint8_t>
+    restore_value: no
+    initial_value: 'std::vector<uint8_t>()'
+
+  # Offline detection – counts consecutive failed polls
+  - id: failed_poll_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Filter timer – seconds remaining at current speed
+  - id: filter_timer_s
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# ------------------------------------------------------------
+#  Logging
+# ------------------------------------------------------------
+logger:
+
+# ============================================================
+#  SENSORS
+# ============================================================
+sensor:
+  - platform: template
+    name: "Pool Pump RPM"
+    id: pump_rpm_state
+    unit_of_measurement: "RPM"
+    accuracy_decimals: 0
+    update_interval: never
+    force_update: false
+    icon: "mdi:pump"
+    state_class: measurement
+
+  - platform: template
+    name: "Pool Pump Filter Time Remaining"
+    id: filter_time_remaining
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    update_interval: never
+    force_update: false
+    icon: "mdi:timer-outline"
+    state_class: measurement
+
+  - platform: wifi_signal
+    name: "WiFi Signalstyrka"
+    update_interval: 60s
+    icon: "mdi:wifi"
+    device_class: signal_strength
+
+  - platform: uptime
+    name: "ESP Uptime"
+    icon: "mdi:clock-outline"
+    device_class: duration
+    unit_of_measurement: "s"
+
+  - platform: internal_temperature
+    name: "ESP Temperatur"
+    icon: "mdi:thermometer"
+    device_class: temperature
+
+# ============================================================
+#  TEXT SENSORS
+# ============================================================
+text_sensor:
+  - platform: template
+    name: "Modbus Status"
+    id: modbus_status
+    icon: "mdi:connection"
+
+  - platform: template
+    name: "Pool Pump Error"
+    id: pump_error_text
+    icon: "mdi:alert-circle-outline"
+
+  - platform: wifi_info
+    ip_address:
+      name: "ESP IP-adress"
+      icon: "mdi:ip-network"
+
+  - platform: version
+    name: "ESPHome Version"
+    icon: "mdi:information-outline"
+
+  # Why did the device last restart? Brownout / watchdog / software /
+  # power-on all look identical from the outside otherwise.
+  - platform: debug
+    reset_reason:
+      name: "ESP Reset Reason"
+      icon: "mdi:restart-alert"
+
+# ------------------------------------------------------------
+#  Debug component (feeds the reset-reason text sensor)
+# ------------------------------------------------------------
+debug:
+  update_interval: 60s
+
+# ============================================================
+#  BINARY SENSORS
+# ============================================================
+binary_sensor:
+  - platform: status
+    name: "ESP Status"
+    icon: "mdi:check-circle-outline"
+    device_class: connectivity
+
+# ============================================================
+#  NUMBER  –  RPM Setpoint
+#  restore_value: true  →  survives reboot (see on_boot guard above)
+# ============================================================
+number:
+  - platform: template
+    name: "Pool Pump RPM Setpoint"
+    id: pump_rpm
+    min_value: 1200   # was 0: with optimistic:true, HA shows whatever the
+    max_value: 2900   # slider was set to, even if the clamp below silently
+    step: 50          # sent something else. 1200 removes that dead zone —
+    restore_value: true  # every value the slider can pick now goes to the
+    optimistic: true   # pump unchanged. OFF stays reachable only via the
+                       # "Pool Pump Power" switch / set_value(1) calls below,
+                       # never via this slider's own range.
+    icon: "mdi:speedometer"
+    unit_of_measurement: "RPM"
+    set_action:
+      then:
+        - lambda: |-
+            uint16_t rpm = (uint16_t)x;
+
+            // Protocol: 1 = OFF, 1200–2900 = run. The slider can no longer
+            // pick a value below 1200 (see min_value above), so this clamp
+            // is now only a defensive fallback for programmatic set_value()
+            // calls (e.g. an HA automation) that pass something odd.
+            // OFF check must still come BEFORE the clamp, otherwise
+            // set_value(1) (= turn off) gets clamped up to 1200 RPM!
+            if (rpm <= 1) {
+              rpm = 1;                       // 0 or 1 → OFF
+            } else if (rpm < 1200) {
+              rpm = 1200;                    // 2–1199 → minimum run speed
+            }
+
+            // Build payload for register 0x0BB9 (addr 3001)
+            uint8_t rpm_hi = (rpm >> 8) & 0xFF;
+            uint8_t rpm_lo =  rpm       & 0xFF;
+            uint8_t payload[6] = {0xAA, 0xD0, 0x0B, 0xB9, rpm_hi, rpm_lo};
+
+            // CRC-16 Modbus (poly 0xA001)
+            uint16_t crc = 0xFFFF;
+            for (int i = 0; i < 6; i++) {
+              crc ^= payload[i];
+              for (int j = 0; j < 8; j++) {
+                crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
+              }
+            }
+
+            // CRC little-endian: lo byte first, hi byte second (per working reference)
+            uint8_t packet[8] = {
+              payload[0], payload[1], payload[2], payload[3],
+              payload[4], payload[5],
+              (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8)
+            };
+
+            id(modbus_write_enable).turn_on();
+            id(modbus_uart).write_array(packet, 8);
+            id(modbus_uart).flush();
+            id(modbus_write_enable).turn_off();
+
+  # Filter duration: how long to run at current speed before returning to ECO
+  - platform: template
+    name: "Pool Pump Filter Duration"
+    id: filter_duration_h
+    min_value: 0
+    max_value: 24
+    step: 0.5
+    restore_value: false
+    optimistic: true
+    icon: "mdi:timer-cog-outline"
+    unit_of_measurement: "h"
+    set_action:
+      then:
+        - lambda: |-
+            // Convert hours to seconds and store in countdown timer
+            id(filter_timer_s) = (int)(x * 3600.0f);
+            id(filter_time_remaining).publish_state(x * 60.0f);
+
+# ============================================================
+#  SWITCH  –  Pump On / Off
+#
+#  restore_mode: DISABLED is essential. Any other mode makes ESPHome write a
+#  state on boot, which runs turn_on_action/turn_off_action and therefore
+#  commands the pump on every restart. The real state is published from the
+#  pump's own status frame one second later anyway.
+# ============================================================
+switch:
+  - platform: template
+    name: "UART Debug Logging"
+    id: uart_debug_enabled
+    icon: "mdi:bug-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    name: "Pool Pump Power"
+    id: pump_power
+    restore_mode: DISABLED
+    icon: "mdi:power"
+    device_class: switch
+    turn_on_action:
+      - lambda: id(pump_rpm).make_call().set_value(1800).perform();
+    turn_off_action:
+      - lambda: |-
+          id(pump_rpm).make_call().set_value(1).perform();
+          id(filter_timer_s) = 0;
+          id(filter_time_remaining).publish_state(0);
+
+# ============================================================
+#  BUTTONS  –  Preset Speeds
+# ============================================================
+button:
+  - platform: template
+    name: "Pool Pump ECO"
+    icon: "mdi:leaf"
+    on_press:
+      - lambda: id(pump_rpm).make_call().set_value(1300).perform();
+
+  - platform: template
+    name: "Pool Pump NORMAL"
+    icon: "mdi:waves"
+    on_press:
+      - lambda: id(pump_rpm).make_call().set_value(1800).perform();
+
+  - platform: template
+    name: "Pool Pump MAX"
+    icon: "mdi:rocket-launch"
+    on_press:
+      - lambda: id(pump_rpm).make_call().set_value(2900).perform();
+
+# ============================================================
+#  INTERVAL  –  Poll pump status every second
+#
+#  Flow per cycle:
+#    1. Drain UART RX into persistent buffer
+#    2. Search for valid packet (header match, noise bytes skipped)
+#    3. Parse and publish / handle offline detection
+#    4. Tick filter countdown timer
+#    5. Send next status-request frame
+#
+#  Response frame (7 bytes, no CRC – verified on bus):
+#    [AA] [C3] [err_hi] [err_lo] [on_off] [rpm_hi] [rpm_lo]
+# ============================================================
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          auto  uart = id(modbus_uart);
+          auto& buf  = id(uart_rx_buffer);
+
+          // ── 1. Drain UART into persistent buffer ──────────────
+          while (uart->available() > 0) {
+            uint8_t b;
+            uart->read_byte(&b);
+            buf.push_back(b);
+            if (buf.size() > 64)    // prevent unbounded growth
+              buf.erase(buf.begin());
+          }
+
+          // ── 2 + 3. Find packet & parse ────────────────────────
+          //   Response: AA C3 [err_hi] [err_lo] [on_off] [rpm_hi] [rpm_lo]
+          //   Pump does not append CRC on response - header match only
+          bool found = false;
+
+          for (int i = 0; i + 6 < (int)buf.size(); i++) {
+            if (buf[i] != 0xAA || buf[i+1] != 0xC3) continue;
+
+            uint8_t* r = &buf[i];
+
+            // ── Error code (register 2001, bits 0–15) ───────────
+            uint16_t error = ((uint16_t)r[2] << 8) | r[3];
+            if (error > 0) {
+              const char* msg = "Unknown error";
+              if      (error & (1 <<  0)) msg = "Error Bit  0: unclear";
+              else if (error & (1 <<  1)) msg = "Error Bit  1: unclear";
+              else if (error & (1 <<  2)) msg = "Error Bit  2: unclear";
+              else if (error & (1 <<  3)) msg = "Error Bit  3: unclear";
+              else if (error & (1 <<  4)) msg = "Error Bit  4: RS485 communication error";
+              else if (error & (1 <<  5)) msg = "Error Bit  5: Auto speed reduction - high temperature";
+              else if (error & (1 <<  6)) msg = "Error Bit  6: Keypad <-> master communication error";
+              else if (error & (1 <<  7)) msg = "Error Bit  7: EEPROM read error";
+              else if (error & (1 <<  8)) msg = "Error Bit  8: RTC read error";
+              else if (error & (1 <<  9)) msg = "Error Bit  9: EEPROM master board error";
+              else if (error & (1 << 10)) msg = "Error Bit 10: Current circuit error";
+              else if (error & (1 << 11)) msg = "Error Bit 11: Master drive error";
+              else if (error & (1 << 12)) msg = "Error Bit 12: Heat-sink sensor error";
+              else if (error & (1 << 13)) msg = "Error Bit 13: Heat-sink overheat";
+              else if (error & (1 << 14)) msg = "Error Bit 14: Output current exceeds limit";
+              else if (error & (1 << 15)) msg = "Error Bit 15: Input voltage abnormal";
+              if (id(pump_error_text).state != msg)
+                id(pump_error_text).publish_state(msg);
+            } else {
+              if (id(pump_error_text).state != "No Error")
+                id(pump_error_text).publish_state("No Error");
+            }
+
+            // ── Converter operation state (Bit0 = pump on) ──────
+            bool is_on = (r[4] & 0x01);
+            if (is_on != id(pump_power).state)
+              id(pump_power).publish_state(is_on);
+
+            // ── Pump running speed ───────────────────────────────
+            // Only update pump_rpm_state (actual RPM display), never pump_rpm
+            // (setpoint) — that would trigger set_action and overwrite the
+            // user's intended value.
+            float rpm = (float)(((uint16_t)r[5] << 8) | r[6]);
+            if (rpm != id(pump_rpm_state).state)
+              id(pump_rpm_state).publish_state(rpm);
+
+            // ── Status, counter reset & buffer cleanup ───────────
+            if (id(modbus_status).state != "Online")
+              id(modbus_status).publish_state("Online");
+            id(failed_poll_count) = 0;
+
+            // Frame is 7 bytes, no CRC. Clamp so we never erase past
+            // the end of the buffer (out-of-range erase = crash).
+            size_t erase_end = (size_t)i + 7;
+            if (erase_end > buf.size()) erase_end = buf.size();
+            buf.erase(buf.begin(), buf.begin() + erase_end);
+
+            found = true;
+            break;
+          }
+
+          // ── Offline detection ─────────────────────────────────
+          if (!found) {
+            id(failed_poll_count) += 1;
+            const char* st = id(failed_poll_count) >= 5 ? "Offline" : "Waiting for packet";
+            if (id(modbus_status).state != st)   // publish only on change (avoid API spam)
+              id(modbus_status).publish_state(st);
+          }
+
+          // ── 4. Filter countdown timer ─────────────────────────
+          if (id(filter_timer_s) > 0) {
+            id(filter_timer_s) -= 1;
+            // Update remaining time display every 30s to avoid HA flooding
+            if (id(filter_timer_s) % 30 == 0) {
+              id(filter_time_remaining).publish_state(
+                (float)id(filter_timer_s) / 60.0f
+              );
+            }
+            // Timer expired: return to ECO speed
+            if (id(filter_timer_s) == 0) {
+              id(pump_rpm).make_call().set_value(1300).perform();
+              id(filter_time_remaining).publish_state(0);
+            }
+          }
+
+          // ── 5. Send next status-request frame ─────────────────
+          //    CRC for {AA,C3,07,D1,00,00} little-endian: 0D 4D  (verified working)
+          uint8_t request[8] = {0xAA, 0xC3, 0x07, 0xD1, 0x00, 0x00, 0x0D, 0x4D};
+          id(modbus_write_enable).turn_on();
+          uart->write_array(request, 8);
+          uart->flush();
+          id(modbus_write_enable).turn_off();

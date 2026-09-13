@@ -1,0 +1,31 @@
+name: ESPHome Validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ESPHome
+        run: pip install esphome
+
+      - name: Create secrets.yaml from example
+        run: cp secrets.yaml.example secrets.yaml
+
+      - name: Validate config
+        run: esphome config pump-rpm-regulator.yaml
+
+      - name: Compile firmware
+        run: esphome compile pump-rpm-regulator.yaml
