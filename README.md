@@ -51,7 +51,46 @@ working over the local network even if Home Assistant itself is down.
 `GPIO05` is a strapping pin — ESPHome warns about it on every build, expected
 on this board. Note: an earlier build of this project used an adapter with no
 DE/RE line at all (auto-direction-sensing); the current firmware assumes one
-is present and toggles it around every write.
+is present and toggles it around every write. Its state is briefly undefined
+between power-on and ESPHome's own setup — harmless in practice since the
+polling loop re-asserts the correct state within a second of boot.
+
+## Protocol
+
+Sources: [htilly/ha-esp32-variable-speed-drive-esphome](https://github.com/htilly/ha-esp32-variable-speed-drive-esphome),
+[backuprestore/isaver-isaverx-RS485-modbus](https://github.com/backuprestore/isaver-isaverx-RS485-modbus),
+and an iSAVER RS485 protocol PDF. Treat the PDF as a starting point, not
+ground truth — its own spec claims a 9-byte response with a trailing CRC,
+which is wrong for this pump (see below).
+
+Called "Modbus" in the source material, but it's a custom protocol, not
+standard Modbus RTU.
+
+**Read status — function `0xC3`:**
+```
+Request  (8 bytes): AA C3 07 D1 00 00 0D 4D
+Response (7 bytes): AA C3 [err_hi] [err_lo] [on_off] [rpm_hi] [rpm_lo]
+```
+
+**Write RPM — function `0xD0`, register `0x0BB9`:**
+```
+Request  (8 bytes): AA D0 0B B9 [rpm_hi] [rpm_lo] [crc_lo] [crc_hi]
+ACK:                AA D0 0B B9 00 02 00
+```
+
+Verified on the bus, all of it counter-intuitive:
+
+- **Responses carry no CRC.** Requests do — CRC-16/Modbus, poly `0xA001`,
+  sent **little-endian** (lo byte first). Validating a CRC on responses
+  silently rejects every frame.
+- **Stray bytes surround every response** (`F8`, `FF`, `FE`, `F0`, `E0`, …)
+  from RS485 bus turnaround — search for the `AA C3` header, never assume a
+  fixed offset.
+- **RPM encoding:** `1` = OFF, `1200`–`2900` = run. The OFF check must come
+  before any clamping, or an off command gets clamped up to minimum speed.
+- **Priming:** the pump runs at max (2900 RPM) for a few minutes after every
+  start, then settles at the setpoint — a high reading right after a start
+  is normal, not a bug.
 
 ## Requirements
 
